@@ -1,0 +1,50 @@
+services:
+  avatar:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8765:8765"
+    volumes:
+      - ./ckpt:/app/ckpt:ro
+      - ./models:/models:ro
+      - ./GestureLSM/config.yaml:/app/config.yaml:ro
+      - ./test.wav:/test.wav:ro
+      - avatar_logs:/app/logs
+    environment:
+      - AVATAR_HOST=0.0.0.0
+      - AVATAR_PORT=8765
+      - AVATAR_THREADS=6
+      - AVATAR_LOG_LEVEL=INFO
+      - AVATAR_LOG_FILE=/app/logs/avatar.log
+      - AVATAR_LOG_JSON=1
+      - AVATAR_SERVER_CORS_ORIGINS=
+      - AVATAR_SERVER_REQUEST_TIMEOUT=300.0
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/ready', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    depends_on:
+      qwen:
+        condition: service_healthy
+
+  qwen:
+    image: ghcr.io/ggerganov/llama.cpp:server
+    command: ["-m", "/models/Qwen3-0.6B-Q4_0.gguf", "--host", "0.0.0.0", "--port", "8080", "--reasoning", "off", "-c", "2048", "-t", "4"]
+    volumes:
+      - ./models/llm:/models:ro
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+volumes:
+  avatar_logs:

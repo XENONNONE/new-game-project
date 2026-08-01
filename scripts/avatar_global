@@ -1,0 +1,5 @@
+#!/bin/sh
+set -eu
+
+ROOT=/root/godot_project
+exec sh "$ROOT/scripts/start_avatar_pipeline.sh" "$@"

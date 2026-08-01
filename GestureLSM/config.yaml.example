@@ -1,0 +1,58 @@
+# GestureLSM Avatar Runtime Configuration
+# Copy to config.yaml and customize. Environment variables override all values.
+
+environment: production
+log_level: INFO
+log_file: ""
+log_json: false
+
+server:
+  host: "0.0.0.0"
+  port: 8765
+  threads: 6
+  timeout: 300.0
+  max_request_bytes: 33554432
+  max_chat_bytes: 1048576
+  rate_limit_per_minute: 60
+  enable_metrics: true
+  enable_health_details: true
+  cors_origins: ""
+  request_timeout: 300.0
+
+pipeline:
+  model_name: "meanflow"
+  checkpoint_dir: ""
+  threads: 6
+  seed: 42
+  cache_infer_test: true
+  torch_compile: false
+
+streaming:
+  enabled: true
+  window_samples: 68224
+  overlap_frames: 16
+  stream_fps: 30
+  ladder_step: 1
+  ladder_strategy: "down"
+  max_concurrent_windows: 1
+  chunk_duration_s: 4.264
+  request_timeout_s: 300.0
+
+llm:
+  chat_url: "http://127.0.0.1:8080/v1/chat/completions"
+  model: "local-qwen"
+  timeout: 120.0
+  max_retries: 3
+  retry_backoff: 1.5
+  circuit_breaker_failures: 5
+  circuit_breaker_timeout: 30.0
+
+tts:
+  backend: "kokoro"
+  kokoro_dir: ""
+  voice: ""
+  lang: "a"
+  command: ""
+  timeout: 120
+  max_retries: 2
+  retry_backoff: 1.5

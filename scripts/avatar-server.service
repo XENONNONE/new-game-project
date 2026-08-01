@@ -1,0 +1,24 @@
+[Unit]
+Description=GestureLSM Avatar Inference Server
+After=network.target
+
+[Service]
+Type=simple
+User=avatar
+Group=avatar
+WorkingDirectory=/opt/avatar/GestureLSM
+Environment=AVATAR_HOST=0.0.0.0
+Environment=AVATAR_PORT=8765
+Environment=AVATAR_THREADS=6
+Environment=AVATAR_LOG_LEVEL=INFO
+Environment=AVATAR_LOG_FILE=/var/log/avatar/server.log
+Environment=AVATAR_LOG_JSON=1
+Environment=AVATAR_SERVER_REQUEST_TIMEOUT=300.0
+ExecStart=/opt/avatar/venv/bin/python -m inference_runtime.server
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

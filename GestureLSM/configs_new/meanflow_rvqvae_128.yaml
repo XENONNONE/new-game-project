@@ -1,0 +1,151 @@
+wandb_project: 'GestureLSM'
+exp_name: 'meanflow_rvqvae_128'
+
+wandb_entity: 'xxxx'
+wandb_key: "xxxxxxx"
+wandb_log_dir: './outputs/wandb'
+output_dir: ./outputs/weights
+log_period: 10
+val_period: 20
+gpus: [0]
+seed: 42
+
+ddp: false
+debug: false
+
+vqvae_upper_path: ./ckpt/net_300000_upper.pth
+vqvae_hands_path: ./ckpt/net_300000_hands.pth
+vqvae_lower_path: ./ckpt/net_300000_lower.pth
+
+
+
+grad_ckpt: False # whether to use gradient checkpointing, for memory saving
+
+
+pre_frames: 4
+pose_length: 128
+vqvae_squeeze_scale: 4
+vqvae_latent_scale: 5
+vae_length: 240
+vae_test_len: 32
+mean_pose_path: "./mean_std/rep15d_mean.npy"
+std_pose_path: "./mean_std/rep15d_std.npy"
+
+data:
+  name_pyfile: "dataloaders.beat_sep_lower"
+  class_name: "CustomDataset"
+  train_bs: 128
+  multi_length_training: [1.0]
+  root_path: ./
+  beat_align: True
+  pose_rep: smplxflame_30
+  
+  pose_norm: True
+  pose_fps: 30
+  rot6d: True
+  pose_dims: 825
+  pose_length: 128
+  stride: 20
+  test_length: 128
+  audio_sr: 16000
+  audio_fps: 16000
+  audio_norm: False
+  
+  data_path_1: ./datasets/hub/
+  data_path: ./datasets/BEAT_SMPL/beat_v2.0.0/beat_english_v2.0.0/
+  training_speakers: [2]
+  additional_data: False
+  cache_path: ./datasets/beat_cache/beat_smplx_en_emage_2_128/
+  new_cache: False
+  disable_filtering: False
+  clean_first_seconds: 0
+  clean_final_seconds: 0
+
+  audio_rep: onset+amplitude
+  word_rep: textgrid
+  t_pre_encoder: fasttext
+  facial_rep: smplxflame_30
+  id_rep: onehot
+  emo_rep: null
+  sem_rep: null
+  test_clip: False
+  onset_rep: True
+
+model:
+  model_name: MeanFlow
+  g_name: GestureMF
+  do_classifier_free_guidance: False
+  cfg_omega: 0.5
+  cfg_kappa: 0.5
+  adaptive_p: 0.5
+  n_steps: 1
+  use_exp: False
+  flow_mode: "v"
+  guidance_scale: 1.0
+  weighting: "adaptive"
+  path_type: "cosine"
+  noise_dist: "logit_normal"
+  data_proportion: 0.5
+  cfg_min_t: 0.0
+  cfg_max_t: 0.9
+  time_mu: 0.0
+  time_sigma: 1.0
+  time_min: 0.0
+  time_max: 1.0
+
+  denoiser:
+    target: models.denoiser.GestureDenoiser
+    params:
+      input_dim: 128
+      latent_dim: 256
+      ff_size: 1024
+      num_layers: 8
+      num_heads: 4
+      dropout: 0.1
+      activation: "gelu"
+      n_seed: 8
+      seq_len: 32
+      flip_sin_to_cos: True
+      freq_shift: 0.0
+      cond_proj_dim: 256
+      use_exp: ${model.use_exp}
+  
+
+  modality_encoder:
+    target: models.layers.modality_encoder.ModalityEncoder
+    params:
+      data_path: ./datasets/BEAT_SMPL/beat_v2.0.0/beat_english_v2.0.0/
+      t_fix_pre: False
+      audio_dim: 256
+      audio_in: 2
+      raw_audio: False
+      latent_dim: 256
+      audio_fps: 30
+      target_length: 128
+      spatial_temporal: True
+      use_exp: ${model.use_exp}
+
+ 
+validation:
+  val_loss_steps: 200
+  validation_steps: 1000
+
+solver:
+  opt: 'adam'
+  epochs: 1000
+  grad_norm: 1.0
+  momentum: 0.8
+  nesterov: True
+  amsgrad: False
+  
+  # lr
+  lr_base: 2e-4
+  lr_policy: 'step'
+  decay_rate: 0.1
+  lr_warmup_steps: 50
+  decay_epochs: 500
+  warmup_epochs: 0
+  warmup_lr: 5e-4
+  lr_min: 1e-7
+  weight_decay: 0.0
+  opt_betas: [0.5, 0.999]

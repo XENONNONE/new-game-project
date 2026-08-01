@@ -1,0 +1,364 @@
+"""Persistent, training-free MeanFlow and RVQ decoder runtime."""
+
+from __future__ import annotations
+
+import contextlib
+import os
+import time
+from collections.abc import Iterator
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+
+import numpy as np
+import torch
+from models.MeanFlow import GestureMF
+from models.vq.model import RVQVAE
+from omegaconf import OmegaConf
+from utils import rotation_conversions as rc
+from utils.joints import hands_body_mask, lower_body_mask, upper_body_mask
+
+import __main__
+
+from .audio import audio_windows, onset_amplitude, read_wav, window_timestamps
+from .config import CONFIG, PROJECT
+from .logging_config import get_logger
+from .retarget import vrm_frames
+
+logger = get_logger("pipeline")
+ROOT = Path(__file__).resolve().parents[1]
+
+# The released language-model pickle was created by a script-local Vocab class.
+# Register the historical name before GestureMF opens it, regardless of entrypoint.
+if not hasattr(__main__, "Vocab"):
+
+    class Vocab:
+        pass
+
+    __main__.Vocab = Vocab
+
+
+def checkpoint(name: str) -> Path:
+    for path in (ROOT / "ckpt" / name, PROJECT / "ckpt" / name):
+        if path.is_file() and ".part" not in path.name:
+            return path
+    raise FileNotFoundError(f"Missing checkpoint: {name}")
+
+
+class GesturePipeline:
+    """Construct once, then reuse. No trainer, dataset, SMPL mesh, or renderer."""
+
+    def __init__(self, threads: int | None = None, seed: int = 42):
+        threads = threads or CONFIG.pipeline.threads or min(6, os.cpu_count() or 4)
+        torch.set_num_threads(threads)
+        with contextlib.suppress(RuntimeError):
+            torch.set_num_interop_threads(1)
+        if CONFIG.pipeline.torch_compile:
+            torch.set_float32_matmul_precision("high")
+        torch.manual_seed(seed)
+        self.timings: dict[str, float] = {}
+        started = time.perf_counter()
+        logger.info("Loading MeanFlow config and checkpoints...")
+        cfg = OmegaConf.load(ROOT / "configs_new/meanflow_rvqvae_128.yaml")
+        cfg.model.modality_encoder.params.data_path = (
+            str(ROOT / "datasets/BEAT_SMPL/beat_v2.0.0/beat_english_v2.0.0") + "/"
+        )
+        self.model = GestureMF(cfg)
+        state = torch.load(checkpoint("meanflow.pth"), map_location="cpu", weights_only=False)
+        state = state.get("model_state_dict", state.get("model_state", state))
+        state = {k.removeprefix("module."): v for k, v in state.items()}
+        self.model.load_state_dict(state, strict=True)
+        self.model.eval()
+        if CONFIG.pipeline.torch_compile:
+            logger.info("Compiling model with torch.compile (backend=inductor)...")
+            self.model = torch.compile(self.model, mode="reduce-overhead", fullgraph=False)
+        self.decoders = {
+            "upper": self._decoder(78, "net_300000_upper.pth"),
+            "hands": self._decoder(180, "net_300000_hands.pth"),
+            "lower": self._decoder(57, "net_300000_lower.pth"),
+        }
+        self.mean = np.load(ROOT / "mean_std/beatx_2_330_mean.npy")
+        self.std = np.load(ROOT / "mean_std/beatx_2_330_std.npy")
+        self.seed = torch.zeros(1, 3, 128, 4)
+        self.overlap_frames = CONFIG.streaming.overlap_frames
+        self.window_samples = CONFIG.streaming.window_samples
+        self.ladder_step = CONFIG.streaming.ladder_step
+        self.ladder_strategy = CONFIG.streaming.ladder_strategy
+        self.stream_fps = CONFIG.streaming.stream_fps
+        self.timings["load_s"] = time.perf_counter() - started
+        logger.info("Pipeline loaded in %.2fs", self.timings["load_s"])
+
+    @staticmethod
+    def _decoder(width: int, name: str) -> Any:
+        args = SimpleNamespace(
+            num_quantizers=6,
+            shared_codebook=False,
+            quantize_dropout_prob=0.2,
+            quantize_dropout_cutoff_index=0,
+            mu=0.99,
+            beta=1.0,
+        )
+        model = RVQVAE(args, width, 1024, 128, 128, 2, 2, 512, 3, 3, "relu", None)
+        model.load_state_dict(
+            torch.load(checkpoint(name), map_location="cpu", weights_only=False)["net"],
+            strict=True,
+        )
+        return model.eval()
+
+    def reset(self) -> None:
+        self.seed.zero_()
+
+    def infer_wav(self, data: bytes, reset: bool = True) -> dict:
+        started = time.perf_counter()
+        audio, info = read_wav(data, return_info=True)
+        self.timings["wav_decode_s"] = time.perf_counter() - started
+        result = self.infer_audio(audio, reset)
+        result["wav"] = info.to_dict()
+        overlap_samples = self.overlap_frames * (16000 // self.stream_fps)
+        result["windows"] = window_timestamps(len(audio), overlap_samples)
+        return result
+
+    def infer_audio(self, audio: np.ndarray, reset: bool = True) -> dict:
+        if reset:
+            self.reset()
+        result: list[dict] = []
+        stage = dict.fromkeys(("feature_s", "meanflow_s", "rvq_s", "retarget_s"), 0.0)
+        overlap_samples = round(self.overlap_frames * 16000 / self.stream_fps)
+        for index, (_, _valid, chunk) in enumerate(audio_windows(audio, overlap=overlap_samples)):
+            t = time.perf_counter()
+            features = torch.from_numpy(onset_amplitude(chunk)).unsqueeze(0)
+            stage["feature_s"] += time.perf_counter() - t
+            cond = {
+                "y": {
+                    "audio_onset": features,
+                    "word": torch.zeros(1, 128, dtype=torch.long),
+                    "id": torch.zeros(1, dtype=torch.long),
+                    "seed": self.seed,
+                    "style_feature": torch.zeros(1, 512),
+                }
+            }
+            t = time.perf_counter()
+            with torch.inference_mode():
+                raw = self.model(cond)["latents"]
+            stage["meanflow_s"] += time.perf_counter() - t
+            self.seed = raw.reshape(1, 3, 128, 32)[..., -4:].contiguous()
+            latent = raw.squeeze(2).permute(0, 2, 1)
+            t = time.perf_counter()
+            matrices = self._decode(latent)
+            stage["rvq_s"] += time.perf_counter() - t
+            t = time.perf_counter()
+            frames = vrm_frames(matrices)
+            stage["retarget_s"] += time.perf_counter() - t
+            if index:
+                self._blend_overlap(result, frames, self.overlap_frames)
+            else:
+                result.extend(frames)
+        result = result[: max(1, round(len(audio) * self.stream_fps / 16000))]
+        self.timings.update(stage)
+        self.timings["total_s"] = sum(stage.values())
+        logger.debug(
+            "Inference complete: %d frames, timings=%s",
+            len(result),
+            stage,
+        )
+        return {
+            "fps": self.stream_fps,
+            "frames": result,
+            "overlap_blend_frames": self.overlap_frames,
+            "timings": dict(self.timings),
+        }
+
+    def infer_stream_wav(self, data: bytes, reset: bool = True) -> Iterator[dict]:
+        """Read WAV bytes and stream gesture frames incrementally.
+
+        Wraps :meth:`infer_stream` with WAV decoding.  Each yielded event
+        contains a batch of frames, the window index, and per-window timings.
+        """
+        started = time.perf_counter()
+        audio, info = read_wav(data, return_info=True)
+        self.timings["wav_decode_s"] = time.perf_counter() - started
+        overlap_samples = round(self.overlap_frames * 16000 / self.stream_fps)
+        yield {
+            "type": "info",
+            "wav": info.to_dict(),
+            "windows": window_timestamps(len(audio), overlap_samples),
+        }
+        total_yielded = 0
+        expected_frames = max(1, round(len(audio) * self.stream_fps / 16000))
+        for event in self.infer_stream(audio, reset):
+            total_yielded += len(event["frames"])
+            yield event
+        if total_yielded < expected_frames:
+            logger.warning("Stream ended early: %d/%d frames", total_yielded, expected_frames)
+
+    def infer_stream(self, audio: np.ndarray, reset: bool = True) -> Iterator[dict]:
+        """Stream gesture frames incrementally as audio windows are processed.
+
+        Inspired by Rolling Diffusion (AAAI 2026) — processes audio in
+        overlapping windows with seed-frame carryover and optional ladder
+        acceleration.  Frames are yielded as they become available, with a
+        small buffer for overlap blending.
+
+        Each yielded event is a dict with keys:
+            - ``type``: "frames" or "done"
+            - ``frames``: list of frame dicts (empty for "done")
+            - ``window_index``: which audio window this batch came from
+            - ``timings``: per-stage timing for this window
+            - ``total_frames``: cumulative frame count
+        """
+        if reset:
+            self.reset()
+        overlap = self.overlap_frames
+        overlap_samples = round(overlap * 16000 / self.stream_fps)
+        buffer: list[dict] = []
+        total_frames = 0
+        stage = dict.fromkeys(("feature_s", "meanflow_s", "rvq_s", "retarget_s"), 0.0)
+        expected_frames = max(1, round(len(audio) * self.stream_fps / 16000))
+
+        for index, (_start, _valid, chunk) in enumerate(
+            audio_windows(audio, overlap=overlap_samples)
+        ):
+            t = time.perf_counter()
+            features = torch.from_numpy(onset_amplitude(chunk)).unsqueeze(0)
+            stage["feature_s"] += time.perf_counter() - t
+            cond = {
+                "y": {
+                    "audio_onset": features,
+                    "word": torch.zeros(1, 128, dtype=torch.long),
+                    "id": torch.zeros(1, dtype=torch.long),
+                    "seed": self.seed,
+                    "style_feature": torch.zeros(1, 512),
+                }
+            }
+            t = time.perf_counter()
+            with torch.inference_mode():
+                raw = self.model(cond)["latents"]
+            stage["meanflow_s"] += time.perf_counter() - t
+            self.seed = raw.reshape(1, 3, 128, 32)[..., -4:].contiguous()
+            latent = raw.squeeze(2).permute(0, 2, 1)
+            t = time.perf_counter()
+            matrices = self._decode(latent)
+            stage["rvq_s"] += time.perf_counter() - t
+            t = time.perf_counter()
+            frames = vrm_frames(matrices)
+            stage["retarget_s"] += time.perf_counter() - t
+
+            if index:
+                blended = self._blend_stream(buffer, frames, overlap)
+                for frame in blended:
+                    total_frames += 1
+                    yield {
+                        "type": "frames",
+                        "frames": [frame],
+                        "window_index": index,
+                        "total_frames": total_frames,
+                        "timings": dict(stage),
+                    }
+                new_frames = frames[overlap:]
+            else:
+                new_frames = frames[:-overlap] if len(frames) > overlap else frames
+
+            for i in range(0, len(new_frames), self.ladder_step):
+                batch = new_frames[i : i + self.ladder_step]
+                total_frames += len(batch)
+                yield {
+                    "type": "frames",
+                    "frames": batch,
+                    "window_index": index,
+                    "total_frames": total_frames,
+                    "timings": dict(stage),
+                }
+
+            buffer = frames[-overlap:] if len(frames) >= overlap else frames
+
+        if buffer:
+            for frame in buffer:
+                total_frames += 1
+                yield {
+                    "type": "frames",
+                    "frames": [frame],
+                    "window_index": -1,
+                    "total_frames": total_frames,
+                    "timings": dict(stage),
+                }
+
+        self.timings.update(stage)
+        self.timings["total_s"] = sum(stage.values())
+        yield {
+            "type": "done",
+            "frames": [],
+            "window_index": -1,
+            "total_frames": total_frames,
+            "expected_frames": expected_frames,
+            "timings": dict(self.timings),
+        }
+
+    @staticmethod
+    def _blend_stream(buffer: list[dict], incoming: list[dict], count: int) -> list[dict]:
+        """Blend buffered frames with incoming frames, returning the blended
+        buffer.  The buffer is modified in-place to match the incoming frames.
+        """
+        overlap = min(count, len(buffer), len(incoming))
+        if overlap == 0:
+            return buffer
+        result: list[dict] = []
+        for i in range(overlap):
+            alpha = (i + 1) / (overlap + 1)
+            previous = buffer[i]
+            current = incoming[i]
+            merged: dict[str, list] = {}
+            for bone in previous.keys() & current.keys():
+                a = np.asarray(previous[bone], dtype=np.float64)
+                b = np.asarray(current[bone], dtype=np.float64)
+                if np.dot(a, b) < 0:
+                    b = -b
+                q = (1 - alpha) * a + alpha * b
+                norm = np.linalg.norm(q)
+                if norm > 1e-8:
+                    q = q / norm
+                merged[bone] = q.tolist()
+            result.append(merged)
+        return result
+
+    @staticmethod
+    def _blend_overlap(result: list[dict], incoming: list[dict], count: int) -> None:
+        """Crossfade duplicate window frames with shortest-path quaternion nlerp."""
+        overlap = min(count, len(result), len(incoming))
+        for i in range(overlap):
+            alpha = (i + 1) / (overlap + 1)
+            previous = result[-overlap + i]
+            current = incoming[i]
+            for bone in previous.keys() & current.keys():
+                a = np.asarray(previous[bone], dtype=np.float64)
+                b = np.asarray(current[bone], dtype=np.float64)
+                if np.dot(a, b) < 0:
+                    b = -b
+                q = (1 - alpha) * a + alpha * b
+                norm = np.linalg.norm(q)
+                if norm > 1e-8:
+                    previous[bone] = (q / norm).tolist()
+        result.extend(incoming[overlap:])
+
+    def _decode(self, latent: torch.Tensor) -> np.ndarray:
+        with torch.inference_mode():
+            u, h, lower = (x * 5 for x in latent.split(128, dim=-1))
+            u = self.decoders["upper"].latent2origin(u)[0]
+            h = self.decoders["hands"].latent2origin(h)[0]
+            lower = self.decoders["lower"].latent2origin(lower)[0][..., :-3]
+            u = u * torch.from_numpy(self.std[upper_body_mask]) + torch.from_numpy(
+                self.mean[upper_body_mask]
+            )
+            h = h * torch.from_numpy(self.std[hands_body_mask]) + torch.from_numpy(
+                self.mean[hands_body_mask]
+            )
+            lower = lower * torch.from_numpy(self.std[lower_body_mask]) + torch.from_numpy(
+                self.mean[lower_body_mask]
+            )
+            pose = torch.zeros(1, u.shape[1], 55, 6, dtype=u.dtype)
+            pose[:, :, [3, 6, 9, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21]] = u.reshape(1, -1, 13, 6)
+            pose[:, :, list(range(25, 55))] = h.reshape(1, -1, 30, 6)
+            pose[:, :, [0, 1, 2, 4, 5, 7, 8, 10, 11]] = lower.reshape(1, -1, 9, 6)
+            pose[:, :, 22:25, 0] = 1
+            pose[:, :, 22:25, 4] = 1
+            result: np.ndarray = rc.rotation_6d_to_matrix(pose).squeeze(0).cpu().numpy()
+            return result
