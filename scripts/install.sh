@@ -50,6 +50,7 @@ pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cpu
 pip install -r "$GESTURE_LSM_DIR/requirements.txt"
 pip install -r "$PROJECT_DIR/requirements-dev.txt"
 pip install kittentts
+pip install onnxruntime  # optional: ONNX acceleration for MeanFlow denoiser
 
 # Set ownership
 if [ "$(id -u)" = "0" ]; then

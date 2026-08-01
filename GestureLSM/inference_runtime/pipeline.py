@@ -12,6 +12,7 @@ from typing import Any
 
 import numpy as np
 import torch
+import torch.nn as nn
 from models.MeanFlow import GestureMF
 from models.vq.model import RVQVAE
 from omegaconf import OmegaConf
@@ -27,6 +28,76 @@ from .retarget import vrm_frames
 
 logger = get_logger("pipeline")
 ROOT = Path(__file__).resolve().parents[1]
+
+# --- Optional ONNX Runtime acceleration ---
+try:
+    import onnxruntime as ort
+    _HAS_ONNXRUNTIME = True
+except ImportError:
+    _HAS_ONNXRUNTIME = False
+    logger.info("onnxruntime not installed; ONNX acceleration disabled")
+
+
+class ONNXDenoiser(nn.Module):
+    """Drop-in replacement for GestureDenoiser using ONNX Runtime.
+
+    Accepts the same positional arguments as the PyTorch denoiser's forward
+    and returns a torch tensor so the surrounding pipeline code is unchanged.
+    """
+
+    def __init__(self, onnx_path: Path, threads: int = 4):
+        super().__init__()
+        if not _HAS_ONNXRUNTIME:
+            raise ImportError("onnxruntime is not installed")
+
+        so = ort.SessionOptions()
+        so.intra_op_num_threads = threads
+        so.inter_op_num_threads = 1
+        so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        so.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        so.add_session_config_entry("session.disable_mem_pattern", "1")
+        so.add_session_config_entry("session.disable_prepacking", "0")
+
+        self._session = ort.InferenceSession(
+            str(onnx_path),
+            so,
+            providers=["CPUExecutionProvider"],
+        )
+        self._input_names = [m.name for m in self._session.get_inputs()]
+        self._output_name = self._session.get_outputs()[0].name
+        logger.info("ONNX denoiser loaded: %s (%d inputs)",
+                     onnx_path.name, len(self._input_names))
+
+    def _to_numpy(self, t: torch.Tensor) -> np.ndarray:
+        return t.detach().cpu().numpy()
+
+    def forward(self, x: torch.Tensor, timesteps: torch.Tensor,
+                cond_time: torch.Tensor | None = None,
+                seed: torch.Tensor | None = None,
+                at_feat: torch.Tensor | None = None) -> torch.Tensor:
+        """Forward pass matching GestureDenoiser.forward signature.
+
+        All arguments are torch tensors (as the PyTorch model expects).
+        The ONNX model was exported with inputs: x, timesteps, cond_time, seed, at_feat.
+        """
+        feeds = {
+            "x": self._to_numpy(x),
+            "timesteps": self._to_numpy(timesteps),
+            "cond_time": self._to_numpy(cond_time) if cond_time is not None else np.zeros((1,), dtype=np.float32),
+            "seed": self._to_numpy(seed) if seed is not None else np.zeros((1,), dtype=np.float32),
+            "at_feat": self._to_numpy(at_feat) if at_feat is not None else np.zeros((1,), dtype=np.float32),
+        }
+        output = self._session.run([self._output_name], feeds)[0]
+        return torch.from_numpy(output)
+
+    def eval(self) -> "ONNXDenoiser":
+        return self
+
+    def parameters(self, *args, **kwargs):
+        return iter([])
+
+    def state_dict(self, *args, **kwargs):
+        return {}
 
 # The released language-model pickle was created by a script-local Vocab class.
 # Register the historical name before GestureMF opens it, regardless of entrypoint.
@@ -69,6 +140,21 @@ class GesturePipeline:
         state = {k.removeprefix("module."): v for k, v in state.items()}
         self.model.load_state_dict(state, strict=True)
         self.model.eval()
+        self.use_onnx = CONFIG.pipeline.use_onnx and _HAS_ONNXRUNTIME
+        if self.use_onnx:
+            onnx_candidates = [
+                PROJECT / "models" / "meanflow_denoiser.int8.onnx",
+                PROJECT / "meanflow_denoiser.int8.onnx",
+                PROJECT / "models" / "meanflow_denoiser.onnx",
+                PROJECT / "meanflow_denoiser.onnx",
+            ]
+            onnx_path = next((p for p in onnx_candidates if p.exists()), None)
+            if onnx_path:
+                logger.info("Replacing denoiser with ONNX Runtime session (%s)...", onnx_path.name)
+                self.model.denoiser = ONNXDenoiser(onnx_path, threads=threads)
+            else:
+                logger.warning("ONNX model not found; falling back to PyTorch")
+                self.use_onnx = False
         if CONFIG.pipeline.torch_compile:
             logger.info("Compiling model with torch.compile (backend=inductor)...")
             self.model = torch.compile(self.model, mode="reduce-overhead", fullgraph=False)

@@ -24,8 +24,9 @@ pipeline:
   checkpoint_dir: ""
   threads: 6
   seed: 42
-  cache_infer_test: true
-  torch_compile: false
+    cache_infer_test: true
+    torch_compile: false
+    use_onnx: false
 
 streaming:
   enabled: true

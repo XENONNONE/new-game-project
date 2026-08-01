@@ -54,6 +54,7 @@ class PipelineConfig:
     seed: int = 42
     cache_infer_test: bool = True
     torch_compile: bool = False
+    use_onnx: bool = False
 
 
 @dataclass
