@@ -49,6 +49,7 @@ pip install --upgrade pip
 pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cpu
 pip install -r "$GESTURE_LSM_DIR/requirements.txt"
 pip install -r "$PROJECT_DIR/requirements-dev.txt"
+pip install kittentts
 
 # Set ownership
 if [ "$(id -u)" = "0" ]; then

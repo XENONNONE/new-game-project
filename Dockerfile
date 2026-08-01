@@ -21,7 +21,7 @@ RUN pip install --no-cache-dir \
     -r /tmp/requirements.txt \
     omegaconf \
     pyyaml \
-    kokoro==0.9.4 \
+    kittentts \
     soundfile \
     "misaki[en]" \
     && rm /tmp/requirements.txt

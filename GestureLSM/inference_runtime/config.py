@@ -89,7 +89,7 @@ class LLMConfig:
 
 @dataclass
 class TTSConfig:
-    backend: str = "kokoro"
+    backend: str = "kitten"
     kokoro_dir: str = ""
     voice: str = ""
     lang: str = "a"

@@ -20,6 +20,7 @@ services:
       - AVATAR_LOG_JSON=1
       - AVATAR_SERVER_CORS_ORIGINS=
       - AVATAR_SERVER_REQUEST_TIMEOUT=300.0
+      - AVATAR_TTS_BACKEND=kitten
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/ready', timeout=5)"]

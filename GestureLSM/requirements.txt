@@ -1,5 +1,6 @@
 loguru
 omegaconf
+kittentts
 tqdm
 smplx
 soundfile

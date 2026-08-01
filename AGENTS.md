@@ -46,12 +46,12 @@ new-game-project/
 ```bash
 # 1. Install Python dependencies (Python 3.12 recommended)
 pip install -r GestureLSM/requirements.txt
-pip install omegaconf pyyaml kokoro==0.9.4 soundfile "misaki[en]"
+pip install kittentts soundfile "misaki[en]"
 
 # 2. Download models (see ANDROID_OFFLINE.md for details)
 #    - GestureLSM checkpoints → ckpt/
 #    - Qwen LLM → models/llm/
-#    - Kokoro TTS → models/tts/kokoro/
+#    - KittenTTS → auto-download from HuggingFace on first use (no manual download needed)
 
 # 3. Run the server
 sh scripts/start_avatar_server.sh

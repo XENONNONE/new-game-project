@@ -48,7 +48,7 @@ llm:
   circuit_breaker_timeout: 30.0
 
 tts:
-  backend: "kokoro"
+  backend: "kitten"
   kokoro_dir: ""
   voice: ""
   lang: "a"
