@@ -20,6 +20,22 @@ from .logging_config import get_logger
 
 logger = get_logger("config")
 
+
+def _load_dotenv() -> None:
+    """Load .env file if present (simple parser, no external dependency)."""
+    for env_path in (Path(".env"), Path("/etc/avatar/.env")):
+        if env_path.is_file():
+            for line in env_path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                key, value = key.strip(), value.strip()
+                if key not in os.environ:
+                    os.environ[key] = value
+
+_load_dotenv()
+
 PROJECT = Path(__file__).resolve().parents[2]
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG_PATHS = [

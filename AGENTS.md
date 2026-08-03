@@ -54,6 +54,7 @@ pip install kittentts onnxruntime soundfile "misaki[en]"
 #    - KittenTTS → auto-download from HuggingFace on first use (no manual download needed)
 #    - ONNX Runtime → pip install onnxruntime (optional, accelerates MeanFlow denoiser ~11x)
 #    - ONNX model → run GestureLSM/tests/test_onnx_export.py to generate (models/meanflow_denoiser.int8.onnx)
+#    - Enable in .env → AVATAR_PIPELINE_USE_ONNX=1
 
 # 3. Run the server
 sh scripts/start_avatar_server.sh
