@@ -22,7 +22,7 @@ server:
 pipeline:
   model_name: "meanflow"
   checkpoint_dir: ""
-   threads: 6
+  threads: 4
   seed: 42
   cache_infer_test: true
   torch_compile: false

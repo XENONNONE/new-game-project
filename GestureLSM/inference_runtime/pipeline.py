@@ -99,6 +99,107 @@ class ONNXDenoiser(nn.Module):
     def state_dict(self, *args, **kwargs):
         return {}
 
+
+class SimpleONNXQuantizer(nn.Module):
+    """Deterministic, ONNX-friendly reimplementation of QuantizeEMAReset.
+
+    In eval mode the original gumbel_sample reduces to argmin(distance)
+    (no noise). This version skips perplexity/commit_loss (not needed for
+    inference) and clones the residual to avoid in-place mutation.
+    """
+
+    def __init__(self, quantizer):
+        super().__init__()
+        self.codebooks = nn.ParameterList()
+        self.embedding_projs = nn.ModuleList()
+        for layer in quantizer.layers:
+            self.codebooks.append(
+                nn.Parameter(layer.codebook.data.clone(), requires_grad=False)
+            )
+            self.embedding_projs.append(layer.embedding_proj)
+        self.num_layers = len(self.codebooks)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: (N, C, T) -> quantized_out: (N, C, T)"""
+        N, C, T = x.shape
+        x_flat = x.permute(0, 2, 1).reshape(-1, C)  # (N*T, C)
+        quantized_out = torch.zeros_like(x_flat)
+        residual = x_flat.clone()
+
+        for layer_idx in range(self.num_layers):
+            projected = self.embedding_projs[layer_idx](self.codebooks[layer_idx])
+            proj_sq = torch.sum(projected ** 2, dim=1, keepdim=True)
+            res_sq = torch.sum(residual ** 2, dim=1, keepdim=True)
+            distance = res_sq - 2 * residual @ projected.t() + proj_sq.t()
+            code_idx = torch.argmin(distance, dim=-1)
+            quantized = projected[code_idx]
+            residual = residual - quantized.detach()
+            quantized_out = quantized_out + quantized
+
+        return quantized_out.view(N, T, C).permute(0, 2, 1)
+
+
+class ONNXRVQDecoder(nn.Module):
+    """ONNX Runtime wrapper for an RVQ quantizer + decoder pair.
+
+    Mirrors the original ``latent2origin`` interface so the pipeline code
+    is unchanged. Runs the quantizer and decoder through ONNX Runtime.
+    """
+
+    def __init__(self, quantizer_onnx: Path, decoder_onnx: Path, threads: int = 4):
+        super().__init__()
+        if not _HAS_ONNXRUNTIME:
+            raise ImportError("onnxruntime is not installed")
+        so = ort.SessionOptions()
+        so.intra_op_num_threads = threads
+        so.inter_op_num_threads = 1
+        so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        so.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+
+        self._q_session = ort.InferenceSession(
+            str(quantizer_onnx), so, providers=["CPUExecutionProvider"]
+        )
+        self._q_output = self._q_session.get_outputs()[0].name
+        self._q_input = self._q_session.get_inputs()[0].name
+
+        self._d_session = ort.InferenceSession(
+            str(decoder_onnx), so, providers=["CPUExecutionProvider"]
+        )
+        self._d_output = self._d_session.get_outputs()[0].name
+        self._d_input = self._d_session.get_inputs()[0].name
+
+        logger.info("ONNX RVQ decoder loaded: %s + %s",
+                     quantizer_onnx.name, decoder_onnx.name)
+
+    def _to_np(self, t: torch.Tensor) -> np.ndarray:
+        return t.detach().cpu().numpy()
+
+    def latent2origin(self, x: torch.Tensor) -> tuple[torch.Tensor, None, None]:
+        """Same interface as RVQVAE.latent2origin.
+
+        input:  (N, T, C) — same shape the pipeline passes
+        output: tuple(x_out, None, None) matching the original return
+        """
+        # latent2origin does x = x.permute(0, 2, 1) -> (N, C, T) for quantizer
+        x_q = x.permute(0, 2, 1).contiguous()
+        x_quantized = self._q_session.run(
+            [self._q_output], {self._q_input: self._to_np(x_q)}
+        )[0]
+        x_out = self._d_session.run(
+            [self._d_output], {self._d_input: x_quantized}
+        )[0]
+        return torch.from_numpy(x_out), None, None
+
+    def eval(self) -> "ONNXRVQDecoder":
+        return self
+
+    def parameters(self, *args, **kwargs):
+        return iter([])
+
+    def state_dict(self, *args, **kwargs):
+        return {}
+
+
 # The released language-model pickle was created by a script-local Vocab class.
 # Register the historical name before GestureMF opens it, regardless of entrypoint.
 if not hasattr(__main__, "Vocab"):
@@ -153,16 +254,19 @@ class GesturePipeline:
                 logger.info("Replacing denoiser with ONNX Runtime session (%s)...", onnx_path.name)
                 self.model.denoiser = ONNXDenoiser(onnx_path, threads=threads)
             else:
-                logger.warning("ONNX model not found; falling back to PyTorch")
+                logger.warning("ONNX denoiser model not found; falling back to PyTorch")
                 self.use_onnx = False
         if CONFIG.pipeline.torch_compile:
             logger.info("Compiling model with torch.compile (backend=inductor)...")
             self.model = torch.compile(self.model, mode="reduce-overhead", fullgraph=False)
-        self.decoders = {
-            "upper": self._decoder(78, "net_300000_upper.pth"),
-            "hands": self._decoder(180, "net_300000_hands.pth"),
-            "lower": self._decoder(57, "net_300000_lower.pth"),
+        rvq_defs = {
+            "upper": (78, "net_300000_upper.pth"),
+            "hands": (180, "net_300000_hands.pth"),
+            "lower": (57, "net_300000_lower.pth"),
         }
+        self.decoders = {name: self._decoder(width, ckpt) for name, (width, ckpt) in rvq_defs.items()}
+        if self.use_onnx:
+            self._swap_decoders_onnx(rvq_defs, threads)
         self.mean = np.load(ROOT / "mean_std/beatx_2_330_mean.npy")
         self.std = np.load(ROOT / "mean_std/beatx_2_330_std.npy")
         self.seed = torch.zeros(1, 3, 128, 4)
@@ -190,6 +294,56 @@ class GesturePipeline:
             strict=True,
         )
         return model.eval()
+
+    def _swap_decoders_onnx(self, rvq_defs: dict, threads: int) -> None:
+        """Replace PyTorch RVQ decoders with ONNX Runtime sessions.
+
+        Exports ONNX models on first use if they don't exist.
+        """
+        for name in rvq_defs:
+            q_path = PROJECT / "models" / f"rvq_quantizer_{name}.onnx"
+            d_path = PROJECT / "models" / f"rvq_decoder_{name}.onnx"
+            if q_path.exists() and d_path.exists():
+                self.decoders[name] = ONNXRVQDecoder(q_path, d_path, threads=threads)
+            else:
+                logger.info("ONNX RVQ models not found for %s; attempting export...", name)
+                if self._export_rvq_onnx(name, rvq_defs[name][0], threads):
+                    self.decoders[name] = ONNXRVQDecoder(q_path, d_path, threads=threads)
+                else:
+                    logger.warning("Failed to export ONNX RVQ for %s; keeping PyTorch", name)
+
+    def _export_rvq_onnx(self, name: str, width: int, threads: int) -> bool:
+        """Export quantizer + decoder for one RVQ model to ONNX."""
+        try:
+            rvq = self.decoders[name]
+            if not isinstance(rvq, RVQVAE):
+                return False
+            seq_len = 32
+            x_in = torch.randn(1, 128, seq_len)
+
+            sq = SimpleONNXQuantizer(rvq.quantizer)
+
+            torch.onnx.export(
+                sq, x_in, str(PROJECT / "models" / f"rvq_quantizer_{name}.onnx"),
+                input_names=["x"], output_names=["output"],
+                dynamic_axes={"x": {0: "batch", 2: "seq"}, "output": {0: "batch", 2: "seq"}},
+                opset_version=17, dynamo=False, do_constant_folding=True,
+            )
+            logger.info("Exported ONNX quantizer for %s", name)
+
+            with torch.no_grad():
+                x_quantized = sq(x_in.clone()).clone()
+            torch.onnx.export(
+                rvq.decoder, x_quantized, str(PROJECT / "models" / f"rvq_decoder_{name}.onnx"),
+                input_names=["x_quantized"], output_names=["output"],
+                dynamic_axes={"x_quantized": {0: "batch", 2: "seq"}, "output": {0: "batch", 2: "seq"}},
+                opset_version=17, dynamo=False, do_constant_folding=True,
+            )
+            logger.info("Exported ONNX decoder for %s", name)
+            return True
+        except Exception as e:
+            logger.error("ONNX export failed for %s: %s", name, e)
+            return False
 
     def reset(self) -> None:
         self.seed.zero_()

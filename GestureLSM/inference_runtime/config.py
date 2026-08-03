@@ -51,7 +51,7 @@ DEFAULT_CONFIG_PATHS = [
 class ServerConfig:
     host: str = "0.0.0.0"
     port: int = 8765
-    threads: int = 6
+    threads: int = 4
     timeout: float = 300.0
     max_request_bytes: int = 33554432
     max_chat_bytes: int = 1048576
