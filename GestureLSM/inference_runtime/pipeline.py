@@ -12,10 +12,10 @@ from typing import Any
 
 import numpy as np
 import torch
-import torch.nn as nn
 from models.MeanFlow import GestureMF
 from models.vq.model import RVQVAE
 from omegaconf import OmegaConf
+from torch import nn
 from utils import rotation_conversions as rc
 from utils.joints import hands_body_mask, lower_body_mask, upper_body_mask
 
@@ -83,14 +83,20 @@ class ONNXDenoiser(nn.Module):
         feeds = {
             "x": self._to_numpy(x),
             "timesteps": self._to_numpy(timesteps),
-            "cond_time": self._to_numpy(cond_time) if cond_time is not None else np.zeros((1,), dtype=np.float32),
-            "seed": self._to_numpy(seed) if seed is not None else np.zeros((1,), dtype=np.float32),
-            "at_feat": self._to_numpy(at_feat) if at_feat is not None else np.zeros((1,), dtype=np.float32),
+            "cond_time": self._to_numpy(cond_time)
+            if cond_time is not None
+            else np.zeros((1,), dtype=np.float32),
+            "seed": self._to_numpy(seed)
+            if seed is not None
+            else np.zeros((1,), dtype=np.float32),
+            "at_feat": self._to_numpy(at_feat)
+            if at_feat is not None
+            else np.zeros((1,), dtype=np.float32),
         }
         output = self._session.run([self._output_name], feeds)[0]
         return torch.from_numpy(output)
 
-    def eval(self) -> "ONNXDenoiser":
+    def eval(self) -> ONNXDenoiser:
         return self
 
     def parameters(self, *args, **kwargs):
@@ -190,7 +196,7 @@ class ONNXRVQDecoder(nn.Module):
         )[0]
         return torch.from_numpy(x_out), None, None
 
-    def eval(self) -> "ONNXRVQDecoder":
+    def eval(self) -> ONNXRVQDecoder:
         return self
 
     def parameters(self, *args, **kwargs):
@@ -264,7 +270,9 @@ class GesturePipeline:
             "hands": (180, "net_300000_hands.pth"),
             "lower": (57, "net_300000_lower.pth"),
         }
-        self.decoders = {name: self._decoder(width, ckpt) for name, (width, ckpt) in rvq_defs.items()}
+        self.decoders = {
+            name: self._decoder(width, ckpt) for name, (width, ckpt) in rvq_defs.items()
+        }
         if self.use_onnx:
             self._swap_decoders_onnx(rvq_defs, threads)
         self.mean = np.load(ROOT / "mean_std/beatx_2_330_mean.npy")
@@ -326,7 +334,9 @@ class GesturePipeline:
             torch.onnx.export(
                 sq, x_in, str(PROJECT / "models" / f"rvq_quantizer_{name}.onnx"),
                 input_names=["x"], output_names=["output"],
-                dynamic_axes={"x": {0: "batch", 2: "seq"}, "output": {0: "batch", 2: "seq"}},
+                dynamic_axes={
+                "x": {0: "batch", 2: "seq"}, "output": {0: "batch", 2: "seq"},
+            },
                 opset_version=17, dynamo=False, do_constant_folding=True,
             )
             logger.info("Exported ONNX quantizer for %s", name)
@@ -336,14 +346,17 @@ class GesturePipeline:
             torch.onnx.export(
                 rvq.decoder, x_quantized, str(PROJECT / "models" / f"rvq_decoder_{name}.onnx"),
                 input_names=["x_quantized"], output_names=["output"],
-                dynamic_axes={"x_quantized": {0: "batch", 2: "seq"}, "output": {0: "batch", 2: "seq"}},
+                dynamic_axes={
+                "x_quantized": {0: "batch", 2: "seq"},
+                "output": {0: "batch", 2: "seq"},
+            },
                 opset_version=17, dynamo=False, do_constant_folding=True,
             )
             logger.info("Exported ONNX decoder for %s", name)
-            return True
-        except Exception as e:
-            logger.error("ONNX export failed for %s: %s", name, e)
+        except Exception:
+            logger.exception("ONNX export failed for %s", name)
             return False
+        return True
 
     def reset(self) -> None:
         self.seed.zero_()

@@ -9,15 +9,15 @@ This script:
 """
 from __future__ import annotations
 
-import time
 import sys
+import time
 import warnings
 from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import torch
-import torch.nn as nn
+from torch import nn
 
 warnings.filterwarnings("ignore")
 
@@ -132,7 +132,11 @@ def export_all():
         # orig_out is (N, C, T), pt_q is (N, C, T)
         cos_q = float(
             np.sum(pt_q.numpy().ravel() * orig_out.numpy().ravel())
-            / (np.linalg.norm(pt_q.numpy().ravel()) * np.linalg.norm(orig_out.numpy().ravel()) + 1e-8)
+            / (
+                np.linalg.norm(pt_q.numpy().ravel())
+                * np.linalg.norm(orig_out.numpy().ravel())
+                + 1e-8
+            )
         )
         print(f"  [{name}] SimpleQuantizer vs original: cos_sim={cos_q:.6f}")
 
@@ -203,10 +207,12 @@ def export_all():
 
         # Benchmark
         with torch.inference_mode():
-            for _ in range(3): _ = rvq.latent2origin(x_in.clone().permute(0, 2, 1))
+            for _ in range(3):
+                _ = rvq.latent2origin(x_in.clone().permute(0, 2, 1))
         t0 = time.perf_counter()
         with torch.inference_mode():
-            for _ in range(10): _ = rvq.latent2origin(x_in.clone().permute(0, 2, 1))
+            for _ in range(10):
+                _ = rvq.latent2origin(x_in.clone().permute(0, 2, 1))
         pt_t = (time.perf_counter() - t0) / 10
 
         for _ in range(3):
@@ -218,7 +224,11 @@ def export_all():
             _ = sess_dec.run(None, {"x_quantized": q[0]})
         onnx_t = (time.perf_counter() - t0) / 10
 
-        print(f"  [{name}] latent2origin PT: {pt_t*1000:.1f}ms, quant+dec ONNX: {onnx_t*1000:.1f}ms, speedup: {pt_t/onnx_t:.1f}x")
+        print(
+            f"  [{name}] latent2origin PT: {pt_t*1000:.1f}ms, "
+            f"quant+dec ONNX: {onnx_t*1000:.1f}ms, "
+            f"speedup: {pt_t/onnx_t:.1f}x"
+        )
 
     print("\n=== ONNX export complete ===")
 
