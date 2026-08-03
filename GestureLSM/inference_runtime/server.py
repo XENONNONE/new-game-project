@@ -27,13 +27,21 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.request import Request, urlopen
 
+import numpy as np
+
 from .config import CONFIG, PROJECT
 from .conversation import parse_speech_plan, qwen_system_prompt
 from .llm import qwen_chat
 from .logging_config import get_logger
 from .pipeline import GesturePipeline
 from .rate_limit import CircuitBreaker, CircuitBreakerOpenError, RateLimiter
-from .tts import synthesize
+from .tts import _load_kitten_model, synthesize
+
+
+def _warmup_kitten(voice: str) -> None:
+    """Run a tiny KittenTTS generation to warm ONNX sessions."""
+    model = _load_kitten_model()
+    model.generate("Hi.", voice=voice)
 
 logger = get_logger("server")
 
@@ -514,6 +522,23 @@ def main() -> None:
     logger.info("Initializing GesturePipeline (threads=%s)...", args.threads)
     Handler.pipeline = GesturePipeline(args.threads)
     logger.info("Pipeline initialized in %.2fs", Handler.pipeline.timings.get("load_s", 0))
+
+    # Pre-warm ONNX gesture pipeline sessions (avoid first-window cold start)
+    if Handler.pipeline.use_onnx:
+        logger.info("Pre-warming ONNX gesture pipeline...")
+        t0 = time.perf_counter()
+        Handler.pipeline.infer_audio(np.zeros(68224, dtype=np.float32))
+        logger.info("ONNX pipeline pre-warmed in %.2fs", time.perf_counter() - t0)
+
+    # Pre-warm TTS model and ONNX sessions to avoid first-request latency
+    if CONFIG.tts.backend == "kitten":
+        logger.info("Pre-warming KittenTTS model...")
+        t0 = time.perf_counter()
+        _load_kitten_model()
+        from .tts import KITTEN_VOICES
+        voice = KITTEN_VOICES.get("neutral", "expr-voice-2-f")
+        _warmup_kitten(voice)
+        logger.info("KittenTTS pre-warmed in %.2fs", time.perf_counter() - t0)
 
     _server = ThreadingHTTPServer((args.host, args.port), Handler)
     _server.daemon_threads = True

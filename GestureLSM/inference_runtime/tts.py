@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import io
-import struct
 import subprocess
 import tempfile
 import threading
@@ -11,6 +10,8 @@ import time
 import wave
 from pathlib import Path
 from typing import Any
+
+import numpy as np
 
 from .config import CONFIG
 from .conversation import AvatarSpeechPlan
@@ -66,33 +67,22 @@ def _run(command: list[str], timeout: int = 120) -> None:
 
 
 def _normalize_wav(source: Path) -> bytes:
-    with wave.open(str(source), "rb") as src:
-        channels, width, rate = (
-            src.getnchannels(),
-            src.getsampwidth(),
-            src.getframerate(),
-        )
-        raw = src.readframes(src.getnframes())
-    if width != 2:
-        raise ValueError(f"TTS backend must emit 16-bit PCM WAV, got {width * 8}-bit")
-    values = struct.unpack(f"<{len(raw) // 2}h", raw)
-    mono = [sum(values[i : i + channels]) / channels for i in range(0, len(values), channels)]
-    count = round(len(mono) * 16000 / rate)
-    output = bytearray(count * 2)
-    if mono and count:
-        scale = rate / 16000
-        for i in range(count):
-            position = min(i * scale, len(mono) - 1)
-            left = int(position)
-            right = min(left + 1, len(mono) - 1)
-            sample = round(mono[left] + (mono[right] - mono[left]) * (position - left))
-            struct.pack_into("<h", output, i * 2, max(-32768, min(32767, sample)))
+    """Convert 24 kHz WAV to 16 kHz mono 16-bit PCM WAV."""
+    import soundfile as sf
+
+    data, rate = sf.read(str(source))
+    if data.ndim > 1:
+        data = data.mean(axis=1)
+    count = int(len(data) * 16000 / rate)
+    indices = np.linspace(0, len(data) - 1, count)
+    resampled = np.interp(indices, np.arange(len(data)), data)
+    int_data = (np.clip(resampled, -1.0, 1.0) * 32767).astype(np.int16)
     target = io.BytesIO()
     with wave.open(target, "wb") as dst:
         dst.setnchannels(1)
         dst.setsampwidth(2)
         dst.setframerate(16000)
-        dst.writeframes(output)
+        dst.writeframes(int_data.tobytes())
     return target.getvalue()
 
 
